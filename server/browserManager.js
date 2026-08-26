@@ -3,6 +3,19 @@
 const { chromium } = require('playwright-core');
 const { guardRoute, assertSafeRemoteUrl, assertSafeWebSocketUrl, toPublicError } = require('./security');
 
+let serverlessChromiumPromise = null;
+
+async function loadServerlessChromium() {
+  if (!serverlessChromiumPromise) {
+    // @sparticuz/chromium v149 is ESM-only. This project otherwise uses
+    // CommonJS on the local server, so require('@sparticuz/chromium') throws
+    // ERR_REQUIRE_ESM on Vercel. Dynamic import works from CommonJS and keeps
+    // the package lazy-loaded only in serverless environments.
+    serverlessChromiumPromise = import('@sparticuz/chromium').then((module) => module.default || module);
+  }
+  return serverlessChromiumPromise;
+}
+
 class BrowserManager {
   constructor({ navigationTimeoutMs = 30000 } = {}) {
     this.browser = null;
@@ -24,7 +37,7 @@ class BrowserManager {
     const launchOptions = { headless: true, args: customArgs };
 
     if (process.env.VERCEL || process.env.SERVERLESS_CHROMIUM === '1') {
-      const serverlessChromium = require('@sparticuz/chromium');
+      const serverlessChromium = await loadServerlessChromium();
       launchOptions.executablePath = await serverlessChromium.executablePath();
       launchOptions.args = [...serverlessChromium.args, ...customArgs];
     } else if (process.env.CHROMIUM_EXECUTABLE_PATH) {
