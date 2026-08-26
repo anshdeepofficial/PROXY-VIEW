@@ -20,7 +20,7 @@ function transferError(code, message, status = 400) {
 }
 
 class BrowserSession {
-  constructor({ id, owner, csrf, manager, proxyManager, proxy, viewport, dpr, idleMs, disconnectGraceMs, maxViewport, maxPages, maxTransferBytes }) {
+  constructor({ id, owner, csrf, manager, proxyManager, proxy, viewport, dpr, idleMs, disconnectGraceMs, maxViewport, maxPages, maxTransferBytes, streamQuality = 82, streamMaxFps = 30, socketBufferLimit = 450000 }) {
     this.id = id;
     this.owner = owner;
     this.csrf = csrf;
@@ -32,6 +32,9 @@ class BrowserSession {
     this.maxViewport = maxViewport;
     this.maxPages = maxPages;
     this.maxTransferBytes = maxTransferBytes;
+    this.streamQuality = clamp(streamQuality, 55, 92);
+    this.streamMaxFps = clamp(streamMaxFps, 12, 45);
+    this.socketBufferLimit = Math.max(128000, Number(socketBufferLimit) || 450000);
     this.idleMs = idleMs;
     this.disconnectGraceMs = disconnectGraceMs;
     this.context = null;
@@ -46,6 +49,10 @@ class BrowserSession {
     this.pendingFileChooser = null;
     this.uploadTransfer = null;
     this.regionRefreshTimer = null;
+    this.crispFrameTimer = null;
+    this.verificationTimer = null;
+    this.lastStreamFrameAt = 0;
+    this.lastVerificationKey = '';
   }
 
   async init() {
@@ -64,7 +71,9 @@ class BrowserSession {
       if (frame === page.mainFrame() && page === this.page) {
         this.broadcastState();
         this.#scheduleEditableRegions(120);
+        this.#scheduleCrispFrame(260);
       }
+      this.#scheduleVerificationCheck(frame === page.mainFrame() ? 900 : 250);
     });
     page.on('filechooser', (chooser) => this.#handleFileChooser(chooser).catch(() => {}));
     page.on('download', (download) => this.#handleDownload(download).catch((error) => {
@@ -78,8 +87,11 @@ class BrowserSession {
     await this.#trimPages();
     this.broadcastState();
     this.#scheduleEditableRegions(40);
+    this.#scheduleCrispFrame(320);
+    this.#scheduleVerificationCheck(1000);
     setTimeout(() => this.#broadcastEditableRegions().catch(() => {}), 650).unref?.();
     setTimeout(() => this.#broadcastEditableRegions().catch(() => {}), 1800).unref?.();
+    setTimeout(() => this.#detectVerificationChallenge().catch(() => {}), 3200).unref?.();
   }
 
   async #trimPages() {
@@ -96,12 +108,23 @@ class BrowserSession {
       try { await this.cdp.detach(); } catch {}
     }
     this.cdp = await this.context.newCDPSession(page);
+    this.lastStreamFrameAt = 0;
+    const frameIntervalMs = Math.max(16, Math.round(1000 / this.streamMaxFps));
+
     this.cdp.on('Page.screencastFrame', async ({ data, sessionId, metadata }) => {
       try {
+        const now = Date.now();
+        if (now - this.lastStreamFrameAt < frameIntervalMs) return;
+        this.lastStreamFrameAt = now;
+
+        const targets = [...this.wsClients].filter(
+          (ws) => ws.readyState === 1 && ws.bufferedAmount < this.socketBufferLimit
+        );
+        if (!targets.length) return;
+
         const frame = Buffer.from(data, 'base64');
-        for (const ws of this.wsClients) {
-          if (ws.readyState === 1 && ws.bufferedAmount < 4_000_000) ws.send(frame, { binary: true });
-        }
+        for (const ws of targets) ws.send(frame, { binary: true });
+
         if (metadata?.deviceWidth && metadata?.deviceHeight) {
           this.lastFrameSize = { width: metadata.deviceWidth, height: metadata.deviceHeight };
         }
@@ -109,15 +132,67 @@ class BrowserSession {
         try { await this.cdp.send('Page.screencastFrameAck', { sessionId }); } catch {}
       }
     });
+
     await this.cdp.send('Page.startScreencast', {
       format: 'jpeg',
-      quality: 96,
+      quality: this.streamQuality,
       maxWidth: Math.round(this.viewport.width * this.dpr),
       maxHeight: Math.round(this.viewport.height * this.dpr),
-      everyNthFrame: 1,
-      maxFramesInFlight: 2,
-      sendLastFrame: true
+      everyNthFrame: 1
     });
+  }
+
+  async #sendCrispFrame(only = null) {
+    if (!this.page || this.page.isClosed()) return;
+    const frame = await this.page.screenshot({ type: 'jpeg', quality: 94, scale: 'device' }).catch(() => null);
+    if (!frame) return;
+    const targets = only ? [only] : this.wsClients;
+    for (const ws of targets) {
+      if (ws.readyState === 1 && ws.bufferedAmount < this.socketBufferLimit * 2) ws.send(frame, { binary: true });
+    }
+  }
+
+  #scheduleCrispFrame(delay = 180) {
+    clearTimeout(this.crispFrameTimer);
+    this.crispFrameTimer = setTimeout(() => this.#sendCrispFrame().catch(() => {}), delay);
+    this.crispFrameTimer.unref?.();
+  }
+
+  async #detectVerificationChallenge() {
+    if (!this.page || this.page.isClosed()) return;
+    let detected = false;
+    let provider = '';
+    try {
+      detected = this.page.frames().some((frame) => /challenges\.cloudflare\.com|turnstile/i.test(frame.url()));
+      if (detected) provider = 'Cloudflare Turnstile';
+      if (!detected) {
+        detected = await this.page.evaluate(() => Boolean(
+          document.querySelector('.cf-turnstile, iframe[src*="challenges.cloudflare.com"], iframe[title*="Cloudflare" i]')
+        )).catch(() => false);
+        if (detected) provider = 'Cloudflare Turnstile';
+      }
+    } catch {}
+
+    const url = this.page.url();
+    const key = detected ? `${provider}|${url}` : '';
+    if (detected && key !== this.lastVerificationKey) {
+      this.lastVerificationKey = key;
+      this.broadcastJson({
+        type: 'verificationChallenge',
+        provider: provider || 'Site verification',
+        url,
+        message: 'This website is asking for a human verification check. Remote automated browser sessions may not be accepted.'
+      });
+    } else if (!detected && this.lastVerificationKey) {
+      this.lastVerificationKey = '';
+      this.broadcastJson({ type: 'verificationClear' });
+    }
+  }
+
+  #scheduleVerificationCheck(delay = 700) {
+    clearTimeout(this.verificationTimer);
+    this.verificationTimer = setTimeout(() => this.#detectVerificationChallenge().catch(() => {}), delay);
+    this.verificationTimer.unref?.();
   }
 
   async #handleFileChooser(chooser) {
@@ -287,11 +362,7 @@ class BrowserSession {
     this.broadcastState(ws);
     this.#broadcastEditableRegions(ws).catch(() => {});
     this.#broadcastFocusedEditable(ws).catch(() => {});
-    if (this.page && !this.page.isClosed()) {
-      this.page.screenshot({ type: 'jpeg', quality: 96, scale: 'device' }).then((frame) => {
-        if (ws.readyState === 1 && ws.bufferedAmount < 4_000_000) ws.send(frame, { binary: true });
-      }).catch(() => {});
-    }
+    if (this.page && !this.page.isClosed()) this.#sendCrispFrame(ws).catch(() => {});
   }
 
   removeClient(ws) {
@@ -478,31 +549,38 @@ class BrowserSession {
     switch (message.action) {
       case 'click':
         await this.page.mouse.click(Number(message.x), Number(message.y), { button: message.button || 'left' });
-        this.#scheduleFocusProbe(35);
-        this.#scheduleEditableRegions(100);
+        this.#scheduleFocusProbe(30);
+        this.#scheduleEditableRegions(80);
+        this.#scheduleVerificationCheck(650);
+        this.#scheduleCrispFrame(150);
         break;
       case 'move':
         await this.page.mouse.move(Number(message.x), Number(message.y));
         break;
       case 'wheel':
         await this.page.mouse.wheel(Number(message.deltaX) || 0, Number(message.deltaY) || 0);
-        this.#scheduleEditableRegions(90);
+        this.#scheduleEditableRegions(70);
+        this.#scheduleCrispFrame(190);
         break;
       case 'key':
         if (message.key) await this.page.keyboard.press(String(message.key));
-        if (['Tab', 'Enter', 'Escape'].includes(String(message.key || ''))) this.#scheduleFocusProbe(35);
+        if (['Tab', 'Enter', 'Escape'].includes(String(message.key || ''))) this.#scheduleFocusProbe(30);
+        this.#scheduleCrispFrame(120);
         break;
       case 'text':
         if (typeof message.text === 'string') await this.page.keyboard.insertText(message.text.slice(0, 4000));
+        this.#scheduleCrispFrame(120);
         break;
       case 'resize': {
         const width = clamp(message.width, 320, this.maxViewport.width);
         const height = clamp(message.height, 360, this.maxViewport.height);
         this.viewport = { width, height };
+        if (message.dpr != null) this.dpr = clamp(message.dpr, 1, 2);
         await this.page.setViewportSize(this.viewport);
         await this.#startScreencast(this.page);
         this.broadcastState();
         this.#scheduleEditableRegions(80);
+        this.#scheduleCrispFrame(220);
         break;
       }
       default:
@@ -516,6 +594,8 @@ class BrowserSession {
     clearTimeout(this.idleTimer);
     clearTimeout(this.disconnectTimer);
     clearTimeout(this.regionRefreshTimer);
+    clearTimeout(this.crispFrameTimer);
+    clearTimeout(this.verificationTimer);
     this.pendingFileChooser = null;
     this.uploadTransfer = null;
     this.broadcastJson({ type: 'expired', reason, message: 'Browser session ended and temporary state was cleared.' });
@@ -535,7 +615,7 @@ class BrowserSession {
 }
 
 class SessionManager {
-  constructor({ browserManager, proxyManager, maxSessions, idleMs, disconnectGraceMs, maxViewport, maxPages, maxDpr = 3, maxTransferBytes = 25 * 1024 * 1024 }) {
+  constructor({ browserManager, proxyManager, maxSessions, idleMs, disconnectGraceMs, maxViewport, maxPages, maxDpr = 2, maxTransferBytes = 25 * 1024 * 1024, streamQuality = 82, streamMaxFps = 30, socketBufferLimit = 450000 }) {
     this.browserManager = browserManager;
     this.proxyManager = proxyManager;
     this.maxSessions = maxSessions;
@@ -545,6 +625,9 @@ class SessionManager {
     this.maxPages = maxPages;
     this.maxDpr = maxDpr;
     this.maxTransferBytes = maxTransferBytes;
+    this.streamQuality = streamQuality;
+    this.streamMaxFps = streamMaxFps;
+    this.socketBufferLimit = socketBufferLimit;
     this.sessions = new Map();
   }
 
@@ -571,7 +654,10 @@ class SessionManager {
       disconnectGraceMs: this.disconnectGraceMs,
       maxViewport: this.maxViewport,
       maxPages: this.maxPages,
-      maxTransferBytes: this.maxTransferBytes
+      maxTransferBytes: this.maxTransferBytes,
+      streamQuality: this.streamQuality,
+      streamMaxFps: this.streamMaxFps,
+      socketBufferLimit: this.socketBufferLimit
     });
     await session.init();
     this.sessions.set(id, session);

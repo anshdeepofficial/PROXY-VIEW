@@ -68,6 +68,15 @@
       </section>
     </section>
 
+    <div class="verification-banner hidden" id="verificationBanner" role="status">
+      <div class="verification-copy">
+        <b>Human verification detected</b>
+        <span id="verificationText">This website is asking for a verification check.</span>
+      </div>
+      <button class="verification-direct" id="openDirectBtn">Open directly</button>
+      <button class="verification-close" id="dismissVerificationBtn" aria-label="Dismiss verification notice">×</button>
+    </div>
+
     <div class="typing-dock hidden" id="typingDock">
       <input id="typingInput" type="text" autocomplete="off" placeholder="Type text into the focused field…">
       <button id="sendTextBtn">Send</button>

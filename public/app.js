@@ -12,7 +12,8 @@ const els = {
   fileDialog: $('fileDialog'), fileDialogText: $('fileDialogText'), chooseFileBtn: $('chooseFileBtn'), cancelFileBtn: $('cancelFileBtn'), localFileInput: $('localFileInput'),
   uploadProgressWrap: $('uploadProgressWrap'), uploadProgressBar: $('uploadProgressBar'), uploadStatus: $('uploadStatus'),
   downloadShelf: $('downloadShelf'), downloadName: $('downloadName'), downloadStatus: $('downloadStatus'), saveDownloadBtn: $('saveDownloadBtn'), closeDownloadBtn: $('closeDownloadBtn'),
-  keyboardProxy: $('keyboardProxy')
+  keyboardProxy: $('keyboardProxy'),
+  verificationBanner: $('verificationBanner'), verificationText: $('verificationText'), openDirectBtn: $('openDirectBtn'), dismissVerificationBtn: $('dismissVerificationBtn')
 };
 
 const ctx = els.canvas.getContext('2d', { alpha: false, desynchronized: true });
@@ -39,7 +40,13 @@ const state = {
   editableRegions: [],
   uploadReadyResolve: null,
   uploadReadyReject: null,
-  composing: false
+  composing: false,
+  pendingFrameBlob: null,
+  frameDecodeBusy: false,
+  wheelDeltaX: 0,
+  wheelDeltaY: 0,
+  wheelRaf: 0,
+  verificationUrl: ''
 };
 
 function viewportSize() {
@@ -79,6 +86,7 @@ function resetSocketState({ clearSession = false } = {}) {
   state.ready = false;
   state.connecting = null;
   state.ws = null;
+  state.pendingFrameBlob = null;
   clearInterval(state.heartbeatTimer);
   state.heartbeatTimer = null;
   if (clearSession) {
@@ -150,7 +158,7 @@ function ensureSession(isReconnect = false) {
       ws.send(JSON.stringify({
         type: 'init',
         ...size,
-        dpr: Math.min(3, Math.max(1, Number(window.devicePixelRatio) || 1)),
+        dpr: Math.min(2, Math.max(1, Number(window.devicePixelRatio) || 1)),
         resumeSessionId: state.sessionId || undefined,
         resumeToken: state.resumeToken || undefined
       }));
@@ -182,17 +190,8 @@ function ensureSession(isReconnect = false) {
         return;
       }
 
-      try {
-        const bitmap = await createImageBitmap(event.data);
-        if (state.imageBitmap) state.imageBitmap.close?.();
-        state.imageBitmap = bitmap;
-        if (els.canvas.width !== bitmap.width || els.canvas.height !== bitmap.height) {
-          els.canvas.width = bitmap.width;
-          els.canvas.height = bitmap.height;
-        }
-        ctx.drawImage(bitmap, 0, 0);
-        hideLoading();
-      } catch {}
+      state.pendingFrameBlob = event.data;
+      pumpFrameDecode();
     };
 
     ws.onerror = () => {};
@@ -210,6 +209,36 @@ function ensureSession(isReconnect = false) {
   });
 
   return state.connecting;
+}
+
+
+async function pumpFrameDecode() {
+  if (state.frameDecodeBusy) return;
+  state.frameDecodeBusy = true;
+  try {
+    while (state.pendingFrameBlob) {
+      const blob = state.pendingFrameBlob;
+      state.pendingFrameBlob = null;
+      try {
+        const bitmap = await createImageBitmap(blob);
+        if (state.pendingFrameBlob) {
+          bitmap.close?.();
+          continue;
+        }
+        if (state.imageBitmap) state.imageBitmap.close?.();
+        state.imageBitmap = bitmap;
+        if (els.canvas.width !== bitmap.width || els.canvas.height !== bitmap.height) {
+          els.canvas.width = bitmap.width;
+          els.canvas.height = bitmap.height;
+        }
+        ctx.drawImage(bitmap, 0, 0);
+        hideLoading();
+      } catch {}
+    }
+  } finally {
+    state.frameDecodeBusy = false;
+    if (state.pendingFrameBlob) pumpFrameDecode();
+  }
 }
 
 function handleServerMessage(message) {
@@ -252,6 +281,13 @@ function handleServerMessage(message) {
     else blurKeyboardProxy();
   } else if (message.type === 'pong') {
     // App-level keepalive acknowledgement.
+  } else if (message.type === 'verificationChallenge') {
+    state.verificationUrl = message.url || state.lastUrl || '';
+    els.verificationText.textContent = `${message.provider || 'Site verification'} detected. This check may reject a remote automated browser session.`;
+    show(els.verificationBanner, true);
+  } else if (message.type === 'verificationClear') {
+    state.verificationUrl = '';
+    show(els.verificationBanner, false);
   } else if (message.type === 'uploadReady') {
     els.uploadStatus.textContent = 'Uploading securely to the remote website…';
     state.uploadReadyResolve?.();
@@ -289,6 +325,8 @@ async function navigate(raw) {
   const url = String(raw || '').trim();
   if (!url) return;
   state.lastUrl = url;
+  state.verificationUrl = '';
+  show(els.verificationBanner, false);
   show(els.remoteWrap, true);
   show(els.homePanel, false);
   showLoading('Connecting…');
@@ -348,17 +386,43 @@ els.canvas.addEventListener('pointermove', (event) => {
   send({ type: 'input', action: 'move', x: p.x, y: p.y });
 });
 
+function queueWheel(deltaX, deltaY) {
+  state.wheelDeltaX += Number(deltaX) || 0;
+  state.wheelDeltaY += Number(deltaY) || 0;
+  if (state.wheelRaf) return;
+  state.wheelRaf = requestAnimationFrame(() => {
+    state.wheelRaf = 0;
+    const dx = state.wheelDeltaX;
+    const dy = state.wheelDeltaY;
+    state.wheelDeltaX = 0;
+    state.wheelDeltaY = 0;
+    if (dx || dy) send({ type: 'input', action: 'wheel', deltaX: dx, deltaY: dy });
+  });
+}
+
+let lastTouchX = null;
 let lastTouchY = null;
-els.canvas.addEventListener('touchstart', (event) => { lastTouchY = event.touches[0]?.clientY ?? null; }, { passive: true });
-els.canvas.addEventListener('touchmove', (event) => {
-  const y = event.touches[0]?.clientY;
-  if (lastTouchY != null && y != null) send({ type: 'input', action: 'wheel', deltaX: 0, deltaY: (lastTouchY - y) * 2.2 });
-  lastTouchY = y;
+els.canvas.addEventListener('touchstart', (event) => {
+  lastTouchX = event.touches[0]?.clientX ?? null;
+  lastTouchY = event.touches[0]?.clientY ?? null;
 }, { passive: true });
-els.canvas.addEventListener('touchend', () => { lastTouchY = null; }, { passive: true });
+els.canvas.addEventListener('touchmove', (event) => {
+  const touch = event.touches[0];
+  const x = touch?.clientX;
+  const y = touch?.clientY;
+  if (lastTouchX != null && lastTouchY != null && x != null && y != null) {
+    queueWheel((lastTouchX - x) * 1.35, (lastTouchY - y) * 1.65);
+  }
+  lastTouchX = x ?? null;
+  lastTouchY = y ?? null;
+}, { passive: true });
+els.canvas.addEventListener('touchend', () => {
+  lastTouchX = null;
+  lastTouchY = null;
+}, { passive: true });
 els.canvas.addEventListener('wheel', (event) => {
   event.preventDefault();
-  send({ type: 'input', action: 'wheel', deltaX: event.deltaX, deltaY: event.deltaY });
+  queueWheel(event.deltaX, event.deltaY);
 }, { passive: false });
 
 function isTouchDevice() {
@@ -442,7 +506,7 @@ els.remoteWrap.addEventListener('keydown', (event) => {
 function sendResize() {
   if (!state.ready) return;
   const size = viewportSize();
-  send({ type: 'input', action: 'resize', ...size, dpr: Math.min(3, Math.max(1, Number(window.devicePixelRatio) || 1)) });
+  send({ type: 'input', action: 'resize', ...size, dpr: Math.min(2, Math.max(1, Number(window.devicePixelRatio) || 1)) });
 }
 
 window.addEventListener('resize', () => {
@@ -484,6 +548,12 @@ els.fullscreenBtn.addEventListener('click', async () => {
 });
 els.menuBtn.addEventListener('click', () => show(els.menuPopover, els.menuPopover.classList.contains('hidden')));
 els.menuEnd.addEventListener('click', () => endSession());
+els.openDirectBtn?.addEventListener('click', () => {
+  const url = state.verificationUrl || state.lastUrl;
+  if (!url) return;
+  window.open(url, '_blank', 'noopener,noreferrer');
+});
+els.dismissVerificationBtn?.addEventListener('click', () => show(els.verificationBanner, false));
 
 document.addEventListener('click', (event) => {
   if (!els.menuPopover.contains(event.target) && event.target !== els.menuBtn) show(els.menuPopover, false);

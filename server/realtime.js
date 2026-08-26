@@ -15,9 +15,12 @@ function createRuntime(env = process.env) {
     width: Number(env.MAX_VIEWPORT_WIDTH || 1920),
     height: Number(env.MAX_VIEWPORT_HEIGHT || 1080)
   };
-  const maxDpr = clamp(env.MAX_STREAM_DPR || 3, 1, 3);
+  const maxDpr = clamp(env.MAX_STREAM_DPR || 2, 1, 2);
   const maxTransferBytes = Math.max(1_048_576, Number(env.MAX_TRANSFER_BYTES || 25 * 1024 * 1024));
   const disconnectGraceMs = Math.max(5_000, Number(env.DISCONNECT_GRACE_SECONDS || 45) * 1000);
+  const streamQuality = clamp(env.STREAM_JPEG_QUALITY || 82, 55, 92);
+  const streamMaxFps = clamp(env.STREAM_MAX_FPS || 30, 12, 45);
+  const socketBufferLimit = Math.max(128000, Number(env.STREAM_SOCKET_BUFFER_BYTES || 450000));
 
   const browserManager = new BrowserManager({ navigationTimeoutMs });
   const proxyManager = new ProxyManager(env);
@@ -30,7 +33,10 @@ function createRuntime(env = process.env) {
     maxViewport,
     maxPages: Number(env.MAX_PAGES_PER_SESSION || 4),
     maxDpr,
-    maxTransferBytes
+    maxTransferBytes,
+    streamQuality,
+    streamMaxFps,
+    socketBufferLimit
   });
 
   return { browserManager, proxyManager, sessions, maxViewport, maxDpr, disconnectGraceMs };
@@ -79,6 +85,46 @@ function attachBrowserWebSocket(server, options = {}) {
     let initInProgress = false;
     let closed = false;
     let queue = Promise.resolve();
+    let wheelDeltaX = 0;
+    let wheelDeltaY = 0;
+    let wheelTimer = null;
+    let latestMove = null;
+    let moveTimer = null;
+
+    const flushWheel = () => {
+      wheelTimer = null;
+      if (!session || (wheelDeltaX === 0 && wheelDeltaY === 0)) return;
+      const deltaX = wheelDeltaX;
+      const deltaY = wheelDeltaY;
+      wheelDeltaX = 0;
+      wheelDeltaY = 0;
+      session.handleInput({ action: 'wheel', deltaX, deltaY }).catch(() => {});
+    };
+
+    const flushMove = () => {
+      moveTimer = null;
+      if (!session || !latestMove) return;
+      const move = latestMove;
+      latestMove = null;
+      session.handleInput(move).catch(() => {});
+    };
+
+    const queueRealtimeInput = (message) => {
+      if (message.action === 'wheel') {
+        wheelDeltaX += Number(message.deltaX) || 0;
+        wheelDeltaY += Number(message.deltaY) || 0;
+        if (!wheelTimer) wheelTimer = setTimeout(flushWheel, 18);
+        wheelTimer?.unref?.();
+        return true;
+      }
+      if (message.action === 'move') {
+        latestMove = message;
+        if (!moveTimer) moveTimer = setTimeout(flushMove, 28);
+        moveTimer?.unref?.();
+        return true;
+      }
+      return false;
+    };
 
     const initTimer = setTimeout(() => {
       if (!session && ws.readyState === 1) ws.close(1008, 'initialization-required');
@@ -169,6 +215,7 @@ function attachBrowserWebSocket(server, options = {}) {
         }
 
         if (message.type === 'input') {
+          if (queueRealtimeInput(message)) return;
           await session.handleInput(message);
           return;
         }
@@ -213,6 +260,8 @@ function attachBrowserWebSocket(server, options = {}) {
       if (closed) return;
       closed = true;
       clearTimeout(initTimer);
+      clearTimeout(wheelTimer);
+      clearTimeout(moveTimer);
       if (session) session.removeClient(ws);
     });
 

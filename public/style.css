@@ -52,7 +52,7 @@ h1 { margin: 0; font-size: clamp(34px, 7vw, 62px); line-height: 1; letter-spacin
 .hero-form button { min-height: 48px; padding: 0 20px; background: var(--accent); color: #0b1020; border: 0; font-weight: 760; }
 
 .remote-wrap { position: absolute; inset: 0; overflow: hidden; outline: none; background: #08090b; touch-action: none; cursor: default; }
-#screenCanvas { width: 100%; height: 100%; display: block; object-fit: contain; background: #fff; }
+#screenCanvas { width: 100%; height: 100%; display: block; object-fit: contain; background: #fff; image-rendering: auto; }
 .loading-overlay, .error-overlay { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(10,12,16,.64); backdrop-filter: blur(8px); z-index: 5; }
 .loading-overlay { align-content: center; gap: 12px; color: #fff; }
 .spinner { width: 36px; height: 36px; border: 3px solid rgba(255,255,255,.18); border-top-color: #fff; border-radius: 50%; animation: spin .8s linear infinite; }
@@ -156,4 +156,50 @@ h1 { margin: 0; font-size: clamp(34px, 7vw, 62px); line-height: 1; letter-spacin
 
 @media (prefers-color-scheme: light) {
   .transfer-card, .download-shelf { background: rgba(255,255,255,.98); }
+}
+
+
+/* Verification notice: informs the user without attempting to bypass site anti-bot controls. */
+.verification-banner {
+  position: fixed;
+  left: 50%;
+  top: 76px;
+  transform: translateX(-50%);
+  z-index: 59;
+  width: min(720px, calc(100% - 20px));
+  display: grid;
+  grid-template-columns: minmax(0,1fr) auto auto;
+  gap: 10px;
+  align-items: center;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(22,25,31,.96);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(16px);
+}
+.verification-copy { min-width: 0; display: grid; gap: 2px; }
+.verification-copy b { font-size: 13px; }
+.verification-copy span { color: var(--muted); font-size: 11px; line-height: 1.35; }
+.verification-direct, .verification-close {
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--panel-2);
+  cursor: pointer;
+}
+.verification-direct { padding: 0 14px; font-weight: 700; }
+.verification-close { width: 38px; font-size: 20px; }
+
+@media (max-width: 640px) {
+  .verification-banner {
+    top: 112px;
+    grid-template-columns: minmax(0,1fr) auto;
+  }
+  .verification-direct { grid-row: 2; grid-column: 1 / -1; width: 100%; }
+  .verification-close { grid-row: 1; grid-column: 2; }
+}
+
+@media (prefers-color-scheme: light) {
+  .verification-banner { background: rgba(255,255,255,.97); }
 }
