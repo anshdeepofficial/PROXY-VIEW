@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#0e1014">
+  <title>Private Browser</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="app-shell" id="appShell">
+    <header class="browser-bar" aria-label="Browser controls">
+      <div class="nav-controls">
+        <button class="icon-btn" id="backBtn" title="Back" aria-label="Back">←</button>
+        <button class="icon-btn" id="forwardBtn" title="Forward" aria-label="Forward">→</button>
+        <button class="icon-btn" id="reloadBtn" title="Reload" aria-label="Reload">↻</button>
+        <button class="identity-btn" id="identityBtn" title="New Identity"><span>⇄</span><b>New Identity</b></button>
+      </div>
+
+      <form class="address-form" id="addressForm" autocomplete="off">
+        <span class="lock-dot" id="securityDot" aria-hidden="true"></span>
+        <input id="addressInput" type="text" inputmode="url" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="Enter a website URL" aria-label="Website address">
+        <button type="submit" class="go-btn">Go</button>
+      </form>
+
+      <div class="status-controls">
+        <span class="status-pill" id="proxyStatus">Direct</span>
+        <span class="status-pill privacy-pill">Temporary</span>
+        <button class="icon-btn" id="keyboardBtn" title="Type into page" aria-label="Type into page">⌨</button>
+        <button class="icon-btn" id="fullscreenBtn" title="Fullscreen" aria-label="Fullscreen">⛶</button>
+        <button class="icon-btn" id="menuBtn" title="Menu" aria-label="Menu">⋮</button>
+      </div>
+    </header>
+
+    <section class="stage" id="stage">
+      <section class="home-panel" id="homePanel">
+        <div class="home-card">
+          <div class="shield-mark">◈</div>
+          <h1>Private Browser</h1>
+          <p>Browse through an isolated temporary session.</p>
+          <form class="hero-form" id="heroForm" autocomplete="off">
+            <input id="heroInput" type="text" inputmode="url" autocapitalize="none" autocomplete="off" spellcheck="false" placeholder="Enter a website URL" aria-label="Website address">
+            <button type="submit">Open Website</button>
+          </form>
+          <small>Session data is temporary and cleared when your session ends.</small>
+        </div>
+      </section>
+
+      <section class="remote-wrap hidden" id="remoteWrap" tabindex="0" aria-label="Remote website viewport">
+        <canvas id="screenCanvas"></canvas>
+        <div class="loading-overlay hidden" id="loadingOverlay">
+          <div class="spinner"></div>
+          <p id="loadingText">Opening secure browser session…</p>
+        </div>
+        <div class="error-overlay hidden" id="errorOverlay">
+          <div class="error-card">
+            <span class="error-icon">!</span>
+            <h2 id="errorTitle">Could not open page</h2>
+            <p id="errorText">The website could not be opened.</p>
+            <div class="error-actions">
+              <button id="retryBtn">Retry</button>
+              <button id="newIdentityErrorBtn">New Identity</button>
+              <button id="homeBtn">Home</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <div class="typing-dock hidden" id="typingDock">
+      <input id="typingInput" type="text" autocomplete="off" placeholder="Type text into the focused field…">
+      <button id="sendTextBtn">Send</button>
+      <button id="backspaceBtn" aria-label="Backspace">⌫</button>
+      <button id="enterKeyBtn">Enter</button>
+      <button id="closeTypingBtn" aria-label="Close typing controls">×</button>
+    </div>
+
+    <div class="menu-popover hidden" id="menuPopover">
+      <button id="menuHome">Home</button>
+      <button id="menuEnd">End session</button>
+      <p>No history is saved by this app.</p>
+    </div>
+
+    <div class="toast hidden" id="toast"></div>
+  </main>
+  <script src="/app.js" defer></script>
+</body>
+</html>
