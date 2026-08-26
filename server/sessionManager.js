@@ -45,6 +45,7 @@ class BrowserSession {
     this.replacingContext = false;
     this.pendingFileChooser = null;
     this.uploadTransfer = null;
+    this.regionRefreshTimer = null;
   }
 
   async init() {
@@ -60,7 +61,10 @@ class BrowserSession {
     this.page = page;
     page.setDefaultNavigationTimeout(this.manager.navigationTimeoutMs);
     page.on('framenavigated', (frame) => {
-      if (frame === page.mainFrame() && page === this.page) this.broadcastState();
+      if (frame === page.mainFrame() && page === this.page) {
+        this.broadcastState();
+        this.#scheduleEditableRegions(120);
+      }
     });
     page.on('filechooser', (chooser) => this.#handleFileChooser(chooser).catch(() => {}));
     page.on('download', (download) => this.#handleDownload(download).catch((error) => {
@@ -73,6 +77,9 @@ class BrowserSession {
     await this.#startScreencast(page);
     await this.#trimPages();
     this.broadcastState();
+    this.#scheduleEditableRegions(40);
+    setTimeout(() => this.#broadcastEditableRegions().catch(() => {}), 650).unref?.();
+    setTimeout(() => this.#broadcastEditableRegions().catch(() => {}), 1800).unref?.();
   }
 
   async #trimPages() {
@@ -104,10 +111,12 @@ class BrowserSession {
     });
     await this.cdp.send('Page.startScreencast', {
       format: 'jpeg',
-      quality: 90,
+      quality: 96,
       maxWidth: Math.round(this.viewport.width * this.dpr),
       maxHeight: Math.round(this.viewport.height * this.dpr),
-      everyNthFrame: 1
+      everyNthFrame: 1,
+      maxFramesInFlight: 2,
+      sendLastFrame: true
     });
   }
 
@@ -167,6 +176,98 @@ class BrowserSession {
     }
   }
 
+
+  async #collectEditableRegions() {
+    if (!this.page || this.page.isClosed()) return [];
+    try {
+      return await this.page.evaluate(() => {
+        const blocked = new Set(['button', 'checkbox', 'color', 'file', 'hidden', 'image', 'radio', 'range', 'reset', 'submit']);
+        const candidates = [...document.querySelectorAll('input, textarea, [contenteditable=""], [contenteditable="true"], [contenteditable="plaintext-only"]')];
+        const regions = [];
+        for (const el of candidates) {
+          const tag = el.tagName.toLowerCase();
+          const type = tag === 'input' ? String(el.getAttribute('type') || 'text').toLowerCase() : tag;
+          const editable = tag === 'textarea' || el.isContentEditable || (tag === 'input' && !blocked.has(type));
+          if (!editable || el.disabled || el.readOnly) continue;
+          const style = getComputedStyle(el);
+          if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || 1) === 0) continue;
+          const rect = el.getBoundingClientRect();
+          if (rect.width < 4 || rect.height < 4 || rect.bottom < 0 || rect.right < 0 || rect.top > innerHeight || rect.left > innerWidth) continue;
+          let inputMode = String(el.getAttribute('inputmode') || '').toLowerCase();
+          if (!inputMode) {
+            if (type === 'email') inputMode = 'email';
+            else if (type === 'url') inputMode = 'url';
+            else if (type === 'tel') inputMode = 'tel';
+            else if (type === 'number') inputMode = 'decimal';
+            else inputMode = 'text';
+          }
+          regions.push({
+            x: Math.max(0, rect.left),
+            y: Math.max(0, rect.top),
+            width: rect.width,
+            height: rect.height,
+            inputMode,
+            multiline: tag === 'textarea' || el.isContentEditable,
+            type
+          });
+          if (regions.length >= 80) break;
+        }
+        return regions;
+      });
+    } catch {
+      return [];
+    }
+  }
+
+  async #broadcastEditableRegions(only = null) {
+    if (this.closed) return;
+    const regions = await this.#collectEditableRegions();
+    this.broadcastJson({ type: 'editableRegions', regions }, only);
+  }
+
+  #scheduleEditableRegions(delay = 80) {
+    clearTimeout(this.regionRefreshTimer);
+    this.regionRefreshTimer = setTimeout(() => this.#broadcastEditableRegions().catch(() => {}), delay);
+    this.regionRefreshTimer.unref?.();
+  }
+
+  async #broadcastFocusedEditable(only = null) {
+    if (!this.page || this.page.isClosed()) return;
+    const frames = this.page.frames();
+    for (const frame of frames) {
+      try {
+        const info = await frame.evaluate(() => {
+          const el = document.activeElement;
+          if (!el) return null;
+          const tag = String(el.tagName || '').toLowerCase();
+          const type = tag === 'input' ? String(el.getAttribute('type') || 'text').toLowerCase() : tag;
+          const blocked = new Set(['button', 'checkbox', 'color', 'file', 'hidden', 'image', 'radio', 'range', 'reset', 'submit']);
+          const editable = tag === 'textarea' || el.isContentEditable || (tag === 'input' && !blocked.has(type));
+          if (!editable || el.disabled || el.readOnly) return null;
+          let inputMode = String(el.getAttribute('inputmode') || '').toLowerCase();
+          if (!inputMode) {
+            if (type === 'email') inputMode = 'email';
+            else if (type === 'url') inputMode = 'url';
+            else if (type === 'tel') inputMode = 'tel';
+            else if (type === 'number') inputMode = 'decimal';
+            else inputMode = 'text';
+          }
+          return { editable: true, inputMode, multiline: tag === 'textarea' || el.isContentEditable, type };
+        });
+        if (info?.editable) {
+          this.broadcastJson({ type: 'focusState', ...info }, only);
+          return;
+        }
+      } catch {}
+    }
+    this.broadcastJson({ type: 'focusState', editable: false }, only);
+  }
+
+  #scheduleFocusProbe(delay = 45) {
+    const timer = setTimeout(() => this.#broadcastFocusedEditable().catch(() => {}), delay);
+    timer.unref?.();
+  }
+
   touch() {
     this.lastActivity = Date.now();
     this.#armIdleTimer();
@@ -184,8 +285,10 @@ class BrowserSession {
     this.wsClients.add(ws);
     this.touch();
     this.broadcastState(ws);
+    this.#broadcastEditableRegions(ws).catch(() => {});
+    this.#broadcastFocusedEditable(ws).catch(() => {});
     if (this.page && !this.page.isClosed()) {
-      this.page.screenshot({ type: 'jpeg', quality: 90 }).then((frame) => {
+      this.page.screenshot({ type: 'jpeg', quality: 96, scale: 'device' }).then((frame) => {
         if (ws.readyState === 1 && ws.bufferedAmount < 4_000_000) ws.send(frame, { binary: true });
       }).catch(() => {});
     }
@@ -352,7 +455,13 @@ class BrowserSession {
 
     this.uploadTransfer = null;
     this.pendingFileChooser = null;
-    await chooser.setFiles(payload);
+    try {
+      await chooser.setFiles(payload);
+    } catch (error) {
+      const element = chooser.element();
+      await element.setInputFiles(payload);
+    }
+    this.#scheduleEditableRegions(120);
     this.broadcastJson({ type: 'uploadComplete', files: payload.length });
   }
 
@@ -369,15 +478,19 @@ class BrowserSession {
     switch (message.action) {
       case 'click':
         await this.page.mouse.click(Number(message.x), Number(message.y), { button: message.button || 'left' });
+        this.#scheduleFocusProbe(35);
+        this.#scheduleEditableRegions(100);
         break;
       case 'move':
         await this.page.mouse.move(Number(message.x), Number(message.y));
         break;
       case 'wheel':
         await this.page.mouse.wheel(Number(message.deltaX) || 0, Number(message.deltaY) || 0);
+        this.#scheduleEditableRegions(90);
         break;
       case 'key':
         if (message.key) await this.page.keyboard.press(String(message.key));
+        if (['Tab', 'Enter', 'Escape'].includes(String(message.key || ''))) this.#scheduleFocusProbe(35);
         break;
       case 'text':
         if (typeof message.text === 'string') await this.page.keyboard.insertText(message.text.slice(0, 4000));
@@ -389,6 +502,7 @@ class BrowserSession {
         await this.page.setViewportSize(this.viewport);
         await this.#startScreencast(this.page);
         this.broadcastState();
+        this.#scheduleEditableRegions(80);
         break;
       }
       default:
@@ -401,6 +515,7 @@ class BrowserSession {
     this.closed = true;
     clearTimeout(this.idleTimer);
     clearTimeout(this.disconnectTimer);
+    clearTimeout(this.regionRefreshTimer);
     this.pendingFileChooser = null;
     this.uploadTransfer = null;
     this.broadcastJson({ type: 'expired', reason, message: 'Browser session ended and temporary state was cleared.' });
@@ -420,7 +535,7 @@ class BrowserSession {
 }
 
 class SessionManager {
-  constructor({ browserManager, proxyManager, maxSessions, idleMs, disconnectGraceMs, maxViewport, maxPages, maxDpr = 2, maxTransferBytes = 25 * 1024 * 1024 }) {
+  constructor({ browserManager, proxyManager, maxSessions, idleMs, disconnectGraceMs, maxViewport, maxPages, maxDpr = 3, maxTransferBytes = 25 * 1024 * 1024 }) {
     this.browserManager = browserManager;
     this.proxyManager = proxyManager;
     this.maxSessions = maxSessions;

@@ -11,12 +11,12 @@ const els = {
   menuPopover: $('menuPopover'), menuHome: $('menuHome'), menuEnd: $('menuEnd'), toast: $('toast'),
   fileDialog: $('fileDialog'), fileDialogText: $('fileDialogText'), chooseFileBtn: $('chooseFileBtn'), cancelFileBtn: $('cancelFileBtn'), localFileInput: $('localFileInput'),
   uploadProgressWrap: $('uploadProgressWrap'), uploadProgressBar: $('uploadProgressBar'), uploadStatus: $('uploadStatus'),
-  downloadShelf: $('downloadShelf'), downloadName: $('downloadName'), downloadStatus: $('downloadStatus'), saveDownloadBtn: $('saveDownloadBtn'), closeDownloadBtn: $('closeDownloadBtn')
+  downloadShelf: $('downloadShelf'), downloadName: $('downloadName'), downloadStatus: $('downloadStatus'), saveDownloadBtn: $('saveDownloadBtn'), closeDownloadBtn: $('closeDownloadBtn'),
+  keyboardProxy: $('keyboardProxy')
 };
 
 const ctx = els.canvas.getContext('2d', { alpha: false, desynchronized: true });
-ctx.imageSmoothingEnabled = true;
-ctx.imageSmoothingQuality = 'high';
+ctx.imageSmoothingEnabled = false;
 const state = {
   ws: null,
   ready: false,
@@ -30,7 +30,16 @@ const state = {
   pendingFileRequest: null,
   uploadBusy: false,
   downloads: new Map(),
-  currentDownloadId: null
+  currentDownloadId: null,
+  sessionId: '',
+  resumeToken: '',
+  reconnectAttempts: 0,
+  reconnectTimer: null,
+  heartbeatTimer: null,
+  editableRegions: [],
+  uploadReadyResolve: null,
+  uploadReadyReject: null,
+  composing: false
 };
 
 function viewportSize() {
@@ -66,33 +75,85 @@ function socketUrl() {
   return `${scheme}//${location.host}/api/browser`;
 }
 
-function resetSocketState() {
+function resetSocketState({ clearSession = false } = {}) {
   state.ready = false;
   state.connecting = null;
   state.ws = null;
+  clearInterval(state.heartbeatTimer);
+  state.heartbeatTimer = null;
+  if (clearSession) {
+    state.sessionId = '';
+    state.resumeToken = '';
+    state.reconnectAttempts = 0;
+  }
 }
 
-function ensureSession() {
-  if (state.ready && state.ws?.readyState === WebSocket.OPEN) return Promise.resolve();
+function startHeartbeat() {
+  clearInterval(state.heartbeatTimer);
+  state.heartbeatTimer = setInterval(() => {
+    if (state.ws?.readyState === WebSocket.OPEN && state.ready) {
+      try { state.ws.send(JSON.stringify({ type: 'ping' })); } catch {}
+    }
+  }, 18_000);
+}
+
+function scheduleReconnect() {
+  if (state.intentionalClose || state.reconnectTimer || !state.lastUrl) return;
+  if (state.reconnectAttempts >= 4) {
+    showError('The remote browser connection could not be restored. Retry to create a new session.', 'CONNECTION_LOST');
+    return;
+  }
+  const delay = [500, 1000, 1800, 3000][state.reconnectAttempts] || 3000;
+  state.reconnectAttempts += 1;
+  showLoading('Reconnecting to your browser session…');
+  state.reconnectTimer = setTimeout(async () => {
+    state.reconnectTimer = null;
+    try {
+      const ready = await ensureSession(true);
+      state.reconnectAttempts = 0;
+      if (!ready?.resumed && state.lastUrl) {
+        showLoading('Restoring website…');
+        send({ type: 'navigate', url: state.lastUrl });
+      } else {
+        hideLoading();
+      }
+    } catch {
+      scheduleReconnect();
+    }
+  }, delay);
+}
+
+function ensureSession(isReconnect = false) {
+  if (state.ready && state.ws?.readyState === WebSocket.OPEN) return Promise.resolve({ resumed: true });
   if (state.connecting) return state.connecting;
 
-  showLoading('Opening secure browser session…');
+  if (!isReconnect) showLoading('Opening secure browser session…');
   state.intentionalClose = false;
 
   state.connecting = new Promise((resolve, reject) => {
     const ws = new WebSocket(socketUrl());
     ws.binaryType = 'blob';
     state.ws = ws;
+    let settled = false;
+    let wasReady = false;
 
     const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
       try { ws.close(); } catch {}
       resetSocketState();
       reject(new Error('The remote browser service did not respond in time.'));
-    }, 15_000);
+    }, 18_000);
 
     ws.onopen = () => {
       const size = viewportSize();
-      ws.send(JSON.stringify({ type: 'init', ...size, dpr: Math.min(2, Math.max(1, Number(window.devicePixelRatio) || 1)) }));
+      ws.send(JSON.stringify({
+        type: 'init',
+        ...size,
+        dpr: Math.min(3, Math.max(1, Number(window.devicePixelRatio) || 1)),
+        resumeSessionId: state.sessionId || undefined,
+        resumeToken: state.resumeToken || undefined
+      }));
     };
 
     ws.onmessage = async (event) => {
@@ -102,13 +163,20 @@ function ensureSession() {
 
         if (message.type === 'ready') {
           clearTimeout(timeout);
+          wasReady = true;
           state.ready = true;
           state.connecting = null;
+          state.sessionId = message.sessionId || '';
+          state.resumeToken = message.resumeToken || '';
           setProxy(message.proxy);
           show(els.remoteWrap, true);
           show(els.homePanel, false);
           sendResize();
-          resolve();
+          startHeartbeat();
+          if (!settled) {
+            settled = true;
+            resolve(message);
+          }
         }
         handleServerMessage(message);
         return;
@@ -122,7 +190,7 @@ function ensureSession() {
           els.canvas.width = bitmap.width;
           els.canvas.height = bitmap.height;
         }
-        ctx.drawImage(bitmap, 0, 0, els.canvas.width, els.canvas.height);
+        ctx.drawImage(bitmap, 0, 0);
         hideLoading();
       } catch {}
     };
@@ -130,15 +198,13 @@ function ensureSession() {
     ws.onerror = () => {};
     ws.onclose = () => {
       clearTimeout(timeout);
-      const wasReady = state.ready;
+      const unexpected = !state.intentionalClose;
       resetSocketState();
-      if (!state.intentionalClose) {
-        const message = wasReady
-          ? 'The temporary browser connection ended. Retry to create a fresh session.'
-          : 'Could not connect to the remote browser service.';
-        showError(message, wasReady ? 'CONNECTION_LOST' : 'WEBSITE_UNREACHABLE');
-        reject(new Error(message));
+      if (!settled) {
+        settled = true;
+        reject(new Error(wasReady ? 'The browser connection ended.' : 'Could not connect to the remote browser service.'));
       }
+      if (unexpected && state.lastUrl) scheduleReconnect();
       state.intentionalClose = false;
     };
   });
@@ -162,6 +228,9 @@ function handleServerMessage(message) {
   } else if (message.type === 'error') {
     const uploadCodes = new Set(['NO_FILE_CHOOSER', 'BAD_UPLOAD', 'BAD_UPLOAD_CHUNK', 'NO_UPLOAD', 'UPLOAD_TOO_LARGE', 'INCOMPLETE_UPLOAD']);
     if (uploadCodes.has(message.code)) {
+      state.uploadReadyReject?.(new Error(message.message || 'The upload could not start.'));
+      state.uploadReadyResolve = null;
+      state.uploadReadyReject = null;
       state.uploadBusy = false;
       els.chooseFileBtn.disabled = false;
       els.cancelFileBtn.disabled = false;
@@ -172,12 +241,22 @@ function handleServerMessage(message) {
     }
   } else if (message.type === 'expired') {
     state.intentionalClose = true;
-    resetSocketState();
+    resetSocketState({ clearSession: true });
     showError(message.message || 'The browser session expired.', 'SESSION_EXPIRED');
   } else if (message.type === 'fileChooser') {
     openFileDialog(message);
+  } else if (message.type === 'editableRegions') {
+    state.editableRegions = Array.isArray(message.regions) ? message.regions : [];
+  } else if (message.type === 'focusState') {
+    if (message.editable) focusKeyboardProxy(message);
+    else blurKeyboardProxy();
+  } else if (message.type === 'pong') {
+    // App-level keepalive acknowledgement.
   } else if (message.type === 'uploadReady') {
     els.uploadStatus.textContent = 'Uploading securely to the remote website…';
+    state.uploadReadyResolve?.();
+    state.uploadReadyResolve = null;
+    state.uploadReadyReject = null;
   } else if (message.type === 'uploadComplete') {
     state.uploadBusy = false;
     show(els.fileDialog, false);
@@ -255,7 +334,12 @@ els.canvas.addEventListener('pointerup', (event) => {
   state.pointerDown = null;
   if (!down) return;
   const moved = Math.hypot(event.clientX - down.clientX, event.clientY - down.clientY);
-  if (moved < 12 && performance.now() - down.time < 700) send({ type: 'input', action: 'click', x: p.x, y: p.y });
+  if (moved < 12 && performance.now() - down.time < 700) {
+    const editable = editableRegionAt(p);
+    if (editable && isTouchDevice()) focusKeyboardProxy(editable);
+    else if (isTouchDevice()) blurKeyboardProxy();
+    send({ type: 'input', action: 'click', x: p.x, y: p.y });
+  }
 });
 
 els.canvas.addEventListener('pointermove', (event) => {
@@ -277,6 +361,75 @@ els.canvas.addEventListener('wheel', (event) => {
   send({ type: 'input', action: 'wheel', deltaX: event.deltaX, deltaY: event.deltaY });
 }, { passive: false });
 
+function isTouchDevice() {
+  return navigator.maxTouchPoints > 0 || matchMedia('(pointer: coarse)').matches;
+}
+
+function editableRegionAt(point) {
+  const margin = 5;
+  for (const region of state.editableRegions) {
+    if (!region) continue;
+    if (point.x >= region.x - margin && point.x <= region.x + region.width + margin &&
+        point.y >= region.y - margin && point.y <= region.y + region.height + margin) return region;
+  }
+  return null;
+}
+
+function safeInputMode(value) {
+  const allowed = new Set(['none', 'text', 'decimal', 'numeric', 'tel', 'search', 'email', 'url']);
+  return allowed.has(String(value || '').toLowerCase()) ? String(value).toLowerCase() : 'text';
+}
+
+function focusKeyboardProxy(info = {}) {
+  if (!isTouchDevice() || !els.keyboardProxy) return;
+  els.keyboardProxy.inputMode = safeInputMode(info.inputMode);
+  els.keyboardProxy.enterKeyHint = info.multiline ? 'enter' : 'done';
+  try { els.keyboardProxy.focus({ preventScroll: true }); } catch { try { els.keyboardProxy.focus(); } catch {} }
+}
+
+function blurKeyboardProxy() {
+  if (document.activeElement === els.keyboardProxy) {
+    try { els.keyboardProxy.blur(); } catch {}
+  }
+}
+
+els.keyboardProxy?.addEventListener('compositionstart', () => { state.composing = true; });
+els.keyboardProxy?.addEventListener('compositionend', (event) => {
+  state.composing = false;
+  if (event.data) send({ type: 'input', action: 'text', text: event.data });
+});
+els.keyboardProxy?.addEventListener('beforeinput', (event) => {
+  if (!state.ready) return;
+  if (state.composing || event.inputType === 'insertCompositionText') return;
+  const type = String(event.inputType || '');
+  if (type === 'deleteContentBackward') {
+    event.preventDefault();
+    send({ type: 'input', action: 'key', key: 'Backspace' });
+  } else if (type === 'deleteContentForward') {
+    event.preventDefault();
+    send({ type: 'input', action: 'key', key: 'Delete' });
+  } else if (type === 'insertLineBreak' || type === 'insertParagraph') {
+    event.preventDefault();
+    send({ type: 'input', action: 'key', key: 'Enter' });
+  } else if (type.startsWith('insert') && typeof event.data === 'string' && event.data) {
+    event.preventDefault();
+    send({ type: 'input', action: 'text', text: event.data });
+  }
+});
+els.keyboardProxy?.addEventListener('paste', (event) => {
+  const text = event.clipboardData?.getData('text/plain');
+  if (text) {
+    event.preventDefault();
+    send({ type: 'input', action: 'text', text: text.slice(0, 4000) });
+  }
+});
+els.keyboardProxy?.addEventListener('keydown', (event) => {
+  if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Tab', 'Escape'].includes(event.key)) {
+    event.preventDefault();
+    send({ type: 'input', action: 'key', key: event.key });
+  }
+});
+
 els.remoteWrap.addEventListener('keydown', (event) => {
   if (event.ctrlKey || event.metaKey || event.altKey) return;
   if (event.key.length === 1) send({ type: 'input', action: 'text', text: event.key });
@@ -289,7 +442,7 @@ els.remoteWrap.addEventListener('keydown', (event) => {
 function sendResize() {
   if (!state.ready) return;
   const size = viewportSize();
-  send({ type: 'input', action: 'resize', ...size });
+  send({ type: 'input', action: 'resize', ...size, dpr: Math.min(3, Math.max(1, Number(window.devicePixelRatio) || 1)) });
 }
 
 window.addEventListener('resize', () => {
@@ -310,7 +463,10 @@ els.newIdentityErrorBtn.addEventListener('click', async () => {
 els.retryBtn.addEventListener('click', () => navigate(state.lastUrl || els.addressInput.value));
 els.homeBtn.addEventListener('click', () => goHome(false));
 els.menuHome.addEventListener('click', () => goHome(false));
-els.keyboardBtn.addEventListener('click', () => { show(els.typingDock, true); els.typingInput.focus(); });
+els.keyboardBtn.addEventListener('click', () => {
+  if (isTouchDevice()) focusKeyboardProxy({ inputMode: 'text' });
+  else { show(els.typingDock, true); els.typingInput.focus(); }
+});
 els.closeTypingBtn.addEventListener('click', () => show(els.typingDock, false));
 els.sendTextBtn.addEventListener('click', () => {
   if (els.typingInput.value) send({ type: 'input', action: 'text', text: els.typingInput.value });
@@ -339,7 +495,7 @@ function endSession() {
   }
   state.intentionalClose = true;
   if (state.ws) try { state.ws.close(1000, 'user-ended'); } catch {}
-  resetSocketState();
+  resetSocketState({ clearSession: true });
   state.lastUrl = '';
   goHome(true);
   toast('Temporary session cleared.');
@@ -360,12 +516,12 @@ function goHome(clearAddress) {
   document.title = 'Private Browser';
 }
 
-window.addEventListener('pagehide', () => {
-  state.intentionalClose = true;
-  if (state.ws?.readyState === WebSocket.OPEN) {
-    try { state.ws.send(JSON.stringify({ type: 'end' })); } catch {}
-    try { state.ws.close(1000, 'page-hidden'); } catch {}
-  }
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && !state.ready && state.lastUrl && !state.intentionalClose) scheduleReconnect();
+});
+
+window.addEventListener('pageshow', () => {
+  if (!state.ready && state.lastUrl && !state.intentionalClose) scheduleReconnect();
 });
 
 
@@ -378,6 +534,8 @@ function formatBytes(bytes) {
 
 function resetUploadUi() {
   state.pendingFileRequest = null;
+  state.uploadReadyResolve = null;
+  state.uploadReadyReject = null;
   els.localFileInput.value = '';
   els.uploadProgressBar.style.width = '0%';
   els.uploadStatus.textContent = '';
@@ -443,10 +601,20 @@ async function uploadSelectedFiles(fileList) {
   els.uploadStatus.textContent = 'Preparing upload…';
 
   try {
-    send({
+    const uploadReady = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        state.uploadReadyResolve = null;
+        state.uploadReadyReject = null;
+        reject(new Error('The remote website did not become ready for the upload.'));
+      }, 8000);
+      state.uploadReadyResolve = () => { clearTimeout(timer); resolve(); };
+      state.uploadReadyReject = (error) => { clearTimeout(timer); reject(error); };
+    });
+    if (!send({
       type: 'uploadStart',
       files: files.map((file) => ({ name: file.name, type: file.type || 'application/octet-stream', size: file.size }))
-    });
+    })) throw new Error('The browser session is not connected.');
+    await uploadReady;
 
     const chunkSize = 96 * 1024;
     let sentBytes = 0;

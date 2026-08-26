@@ -67,6 +67,26 @@ h1 { margin: 0; font-size: clamp(34px, 7vw, 62px); line-height: 1; letter-spacin
 .typing-dock input { min-width: 0; height: 42px; border: 1px solid var(--line); border-radius: 11px; outline: 0; background: #11141a; color: var(--text); padding: 0 12px; }
 .typing-dock button { min-height: 42px; padding: 0 12px; }
 
+
+.keyboard-proxy {
+  position: fixed;
+  left: 50%;
+  bottom: 0;
+  width: 2px;
+  height: 2px;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  opacity: .001;
+  color: transparent;
+  caret-color: transparent;
+  background: transparent;
+  transform: translate(-50%, 150%);
+  pointer-events: none;
+  font-size: 16px;
+  z-index: 1;
+}
+
 .menu-popover { position: fixed; top: 60px; right: 12px; z-index: 40; width: 210px; padding: 8px; border: 1px solid var(--line); border-radius: 16px; background: rgba(22,25,31,.98); box-shadow: var(--shadow); }
 .menu-popover button { width: 100%; text-align: left; padding: 0 12px; margin-bottom: 6px; }
 .menu-popover p { margin: 8px 8px 4px; color: var(--muted); font-size: 11px; line-height: 1.4; }

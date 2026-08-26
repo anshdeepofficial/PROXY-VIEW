@@ -4,7 +4,7 @@
   "outputDirectory": "public",
   "functions": {
     "api/browser.mjs": {
-      "maxDuration": 60
+      "maxDuration": 300
     }
   },
   "headers": [

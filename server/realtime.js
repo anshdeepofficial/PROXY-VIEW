@@ -15,8 +15,9 @@ function createRuntime(env = process.env) {
     width: Number(env.MAX_VIEWPORT_WIDTH || 1920),
     height: Number(env.MAX_VIEWPORT_HEIGHT || 1080)
   };
-  const maxDpr = clamp(env.MAX_STREAM_DPR || 2, 1, 2.5);
+  const maxDpr = clamp(env.MAX_STREAM_DPR || 3, 1, 3);
   const maxTransferBytes = Math.max(1_048_576, Number(env.MAX_TRANSFER_BYTES || 25 * 1024 * 1024));
+  const disconnectGraceMs = Math.max(5_000, Number(env.DISCONNECT_GRACE_SECONDS || 45) * 1000);
 
   const browserManager = new BrowserManager({ navigationTimeoutMs });
   const proxyManager = new ProxyManager(env);
@@ -25,14 +26,14 @@ function createRuntime(env = process.env) {
     proxyManager,
     maxSessions: Number(env.MAX_SESSIONS || (env.VERCEL ? 2 : 10)),
     idleMs: Number(env.SESSION_TIMEOUT_MINUTES || 20) * 60_000,
-    disconnectGraceMs: 0,
+    disconnectGraceMs,
     maxViewport,
     maxPages: Number(env.MAX_PAGES_PER_SESSION || 4),
     maxDpr,
     maxTransferBytes
   });
 
-  return { browserManager, proxyManager, sessions, maxViewport, maxDpr };
+  return { browserManager, proxyManager, sessions, maxViewport, maxDpr, disconnectGraceMs };
 }
 
 function isAllowedBrowserOrigin(req) {
@@ -53,23 +54,52 @@ function attachBrowserWebSocket(server, options = {}) {
   const maxPayload = 512 * 1024;
   const wss = new WebSocketServer({ server, maxPayload, perMessageDeflate: false });
 
+  const heartbeat = setInterval(() => {
+    for (const ws of wss.clients) {
+      if (ws.isAlive === false) {
+        try { ws.terminate(); } catch {}
+        continue;
+      }
+      ws.isAlive = false;
+      try { ws.ping(); } catch {}
+    }
+  }, 25_000);
+  heartbeat.unref?.();
+
   wss.on('connection', (ws, req) => {
     if (!isAllowedBrowserOrigin(req)) {
       ws.close(1008, 'origin-not-allowed');
       return;
     }
 
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
+
     let session = null;
     let initInProgress = false;
     let closed = false;
+    let queue = Promise.resolve();
 
     const initTimer = setTimeout(() => {
       if (!session && ws.readyState === 1) ws.close(1008, 'initialization-required');
-    }, 10_000);
+    }, 12_000);
     initTimer.unref?.();
 
     const sendJson = (payload) => {
       if (ws.readyState === 1) ws.send(JSON.stringify(payload));
+    };
+
+    const sendReady = (resumed) => {
+      sendJson({
+        type: 'ready',
+        sessionId: session.id,
+        resumeToken: session.owner,
+        resumed: Boolean(resumed),
+        proxy: runtime.proxyManager.describe(session.proxy),
+        timeoutMinutes: Number(process.env.SESSION_TIMEOUT_MINUTES || 20),
+        dpr: session.dpr,
+        disconnectGraceSeconds: Math.round(runtime.disconnectGraceMs / 1000)
+      });
     };
 
     const destroySession = async (reason) => {
@@ -79,7 +109,7 @@ function attachBrowserWebSocket(server, options = {}) {
       await runtime.sessions.destroy(current.id, current.owner, reason).catch(() => {});
     };
 
-    ws.on('message', async (data, isBinary) => {
+    const processMessage = async (data, isBinary) => {
       if (isBinary || data.length > maxPayload) return;
 
       let message;
@@ -89,6 +119,21 @@ function attachBrowserWebSocket(server, options = {}) {
         if (!session) {
           if (message.type !== 'init' || initInProgress) return;
           initInProgress = true;
+
+          const resumeId = typeof message.resumeSessionId === 'string' ? message.resumeSessionId : '';
+          const resumeToken = typeof message.resumeToken === 'string' ? message.resumeToken : '';
+          if (resumeId && resumeToken) {
+            const existing = runtime.sessions.get(resumeId, resumeToken);
+            if (existing) {
+              session = existing;
+              clearTimeout(initTimer);
+              session.addClient(ws);
+              sendReady(true);
+              initInProgress = false;
+              return;
+            }
+          }
+
           const width = clamp(message.width, 320, runtime.maxViewport.width);
           const height = clamp(message.height, 360, runtime.maxViewport.height);
           const dpr = clamp(message.dpr || 1, 1, runtime.maxDpr);
@@ -98,14 +143,14 @@ function attachBrowserWebSocket(server, options = {}) {
           session = await runtime.sessions.create({ owner, csrf, viewport: { width, height }, dpr });
           clearTimeout(initTimer);
           session.addClient(ws);
-          sendJson({
-            type: 'ready',
-            sessionId: session.id,
-            proxy: runtime.proxyManager.describe(session.proxy),
-            timeoutMinutes: Number(process.env.SESSION_TIMEOUT_MINUTES || 20),
-            dpr: session.dpr
-          });
+          sendReady(false);
           initInProgress = false;
+          return;
+        }
+
+        if (message.type === 'ping') {
+          session.touch();
+          sendJson({ type: 'pong', at: Date.now() });
           return;
         }
 
@@ -158,13 +203,17 @@ function attachBrowserWebSocket(server, options = {}) {
         sendJson({ type: 'error', ...toPublicError(error) });
         if (failedDuringInit && ws.readyState === 1) ws.close(1011, 'browser-initialization-failed');
       }
+    };
+
+    ws.on('message', (data, isBinary) => {
+      queue = queue.then(() => processMessage(data, isBinary)).catch(() => {});
     });
 
-    ws.on('close', async () => {
+    ws.on('close', () => {
       if (closed) return;
       closed = true;
       clearTimeout(initTimer);
-      await destroySession('disconnected');
+      if (session) session.removeClient(ws);
     });
 
     ws.on('error', () => {});
@@ -174,6 +223,7 @@ function attachBrowserWebSocket(server, options = {}) {
     ...runtime,
     wss,
     async close() {
+      clearInterval(heartbeat);
       for (const client of wss.clients) {
         try { client.close(1001, 'server-shutdown'); } catch {}
       }
