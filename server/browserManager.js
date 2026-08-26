@@ -7,10 +7,6 @@ let serverlessChromiumPromise = null;
 
 async function loadServerlessChromium() {
   if (!serverlessChromiumPromise) {
-    // @sparticuz/chromium v149 is ESM-only. This project otherwise uses
-    // CommonJS on the local server, so require('@sparticuz/chromium') throws
-    // ERR_REQUIRE_ESM on Vercel. Dynamic import works from CommonJS and keeps
-    // the package lazy-loaded only in serverless environments.
     serverlessChromiumPromise = import('@sparticuz/chromium').then((module) => module.default || module);
   }
   return serverlessChromiumPromise;
@@ -48,13 +44,14 @@ class BrowserManager {
     return this.browser;
   }
 
-  async createContext({ proxy, viewport }) {
+  async createContext({ proxy, viewport, deviceScaleFactor = 1 }) {
     await this.start();
     const context = await this.browser.newContext({
       viewport,
+      deviceScaleFactor,
       proxy: proxy || undefined,
       ignoreHTTPSErrors: false,
-      acceptDownloads: false,
+      acceptDownloads: true,
       javaScriptEnabled: true,
       serviceWorkers: 'block'
     });

@@ -15,6 +15,8 @@ function createRuntime(env = process.env) {
     width: Number(env.MAX_VIEWPORT_WIDTH || 1920),
     height: Number(env.MAX_VIEWPORT_HEIGHT || 1080)
   };
+  const maxDpr = clamp(env.MAX_STREAM_DPR || 2, 1, 2.5);
+  const maxTransferBytes = Math.max(1_048_576, Number(env.MAX_TRANSFER_BYTES || 25 * 1024 * 1024));
 
   const browserManager = new BrowserManager({ navigationTimeoutMs });
   const proxyManager = new ProxyManager(env);
@@ -23,14 +25,14 @@ function createRuntime(env = process.env) {
     proxyManager,
     maxSessions: Number(env.MAX_SESSIONS || (env.VERCEL ? 2 : 10)),
     idleMs: Number(env.SESSION_TIMEOUT_MINUTES || 20) * 60_000,
-    // A disconnected Vercel socket cannot safely recover the in-memory Chromium
-    // context on another Function instance, so connections are destroyed on close.
     disconnectGraceMs: 0,
     maxViewport,
-    maxPages: Number(env.MAX_PAGES_PER_SESSION || 4)
+    maxPages: Number(env.MAX_PAGES_PER_SESSION || 4),
+    maxDpr,
+    maxTransferBytes
   });
 
-  return { browserManager, proxyManager, sessions, maxViewport };
+  return { browserManager, proxyManager, sessions, maxViewport, maxDpr };
 }
 
 function isAllowedBrowserOrigin(req) {
@@ -48,7 +50,8 @@ function isAllowedBrowserOrigin(req) {
 
 function attachBrowserWebSocket(server, options = {}) {
   const runtime = options.runtime || createRuntime(options.env || process.env);
-  const wss = new WebSocketServer({ server, maxPayload: 32 * 1024, perMessageDeflate: false });
+  const maxPayload = 512 * 1024;
+  const wss = new WebSocketServer({ server, maxPayload, perMessageDeflate: false });
 
   wss.on('connection', (ws, req) => {
     if (!isAllowedBrowserOrigin(req)) {
@@ -77,7 +80,7 @@ function attachBrowserWebSocket(server, options = {}) {
     };
 
     ws.on('message', async (data, isBinary) => {
-      if (isBinary || data.length > 32 * 1024) return;
+      if (isBinary || data.length > maxPayload) return;
 
       let message;
       try { message = JSON.parse(data.toString('utf8')); } catch { return; }
@@ -88,17 +91,19 @@ function attachBrowserWebSocket(server, options = {}) {
           initInProgress = true;
           const width = clamp(message.width, 320, runtime.maxViewport.width);
           const height = clamp(message.height, 360, runtime.maxViewport.height);
+          const dpr = clamp(message.dpr || 1, 1, runtime.maxDpr);
           const owner = crypto.randomBytes(24).toString('base64url');
           const csrf = crypto.randomBytes(24).toString('base64url');
 
-          session = await runtime.sessions.create({ owner, csrf, viewport: { width, height } });
+          session = await runtime.sessions.create({ owner, csrf, viewport: { width, height }, dpr });
           clearTimeout(initTimer);
           session.addClient(ws);
           sendJson({
             type: 'ready',
             sessionId: session.id,
             proxy: runtime.proxyManager.describe(session.proxy),
-            timeoutMinutes: Number(process.env.SESSION_TIMEOUT_MINUTES || 20)
+            timeoutMinutes: Number(process.env.SESSION_TIMEOUT_MINUTES || 20),
+            dpr: session.dpr
           });
           initInProgress = false;
           return;
@@ -120,6 +125,26 @@ function attachBrowserWebSocket(server, options = {}) {
 
         if (message.type === 'input') {
           await session.handleInput(message);
+          return;
+        }
+
+        if (message.type === 'uploadStart') {
+          await session.beginUpload(message);
+          return;
+        }
+
+        if (message.type === 'uploadChunk') {
+          await session.appendUploadChunk(message);
+          return;
+        }
+
+        if (message.type === 'uploadEnd') {
+          await session.finishUpload();
+          return;
+        }
+
+        if (message.type === 'uploadCancel') {
+          await session.cancelUpload();
           return;
         }
 

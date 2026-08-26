@@ -82,6 +82,31 @@
       <p>No history is saved by this app.</p>
     </div>
 
+    <div class="transfer-dialog hidden" id="fileDialog" role="dialog" aria-modal="true" aria-labelledby="fileDialogTitle">
+      <div class="transfer-card">
+        <div class="transfer-icon">↑</div>
+        <h3 id="fileDialogTitle">Choose file for website</h3>
+        <p id="fileDialogText">The remote website is asking you to select a file from this device.</p>
+        <div class="transfer-progress hidden" id="uploadProgressWrap"><span id="uploadProgressBar"></span></div>
+        <small class="transfer-status" id="uploadStatus"></small>
+        <div class="transfer-actions">
+          <button class="primary" id="chooseFileBtn">Choose file</button>
+          <button id="cancelFileBtn">Cancel</button>
+        </div>
+      </div>
+    </div>
+    <input class="hidden" id="localFileInput" type="file">
+
+    <div class="download-shelf hidden" id="downloadShelf" aria-live="polite">
+      <div class="download-mark">↓</div>
+      <div class="download-copy">
+        <b id="downloadName">Download</b>
+        <span id="downloadStatus">Receiving file…</span>
+      </div>
+      <button class="download-save" id="saveDownloadBtn" disabled>Save</button>
+      <button class="download-close" id="closeDownloadBtn" aria-label="Close download">×</button>
+    </div>
+
     <div class="toast hidden" id="toast"></div>
   </main>
   <script src="/app.js" defer></script>

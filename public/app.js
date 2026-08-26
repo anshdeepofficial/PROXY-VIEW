@@ -8,10 +8,15 @@ const els = {
   backBtn: $('backBtn'), forwardBtn: $('forwardBtn'), reloadBtn: $('reloadBtn'), identityBtn: $('identityBtn'), keyboardBtn: $('keyboardBtn'), fullscreenBtn: $('fullscreenBtn'),
   retryBtn: $('retryBtn'), newIdentityErrorBtn: $('newIdentityErrorBtn'), homeBtn: $('homeBtn'), typingDock: $('typingDock'), typingInput: $('typingInput'),
   sendTextBtn: $('sendTextBtn'), backspaceBtn: $('backspaceBtn'), enterKeyBtn: $('enterKeyBtn'), closeTypingBtn: $('closeTypingBtn'), menuBtn: $('menuBtn'),
-  menuPopover: $('menuPopover'), menuHome: $('menuHome'), menuEnd: $('menuEnd'), toast: $('toast')
+  menuPopover: $('menuPopover'), menuHome: $('menuHome'), menuEnd: $('menuEnd'), toast: $('toast'),
+  fileDialog: $('fileDialog'), fileDialogText: $('fileDialogText'), chooseFileBtn: $('chooseFileBtn'), cancelFileBtn: $('cancelFileBtn'), localFileInput: $('localFileInput'),
+  uploadProgressWrap: $('uploadProgressWrap'), uploadProgressBar: $('uploadProgressBar'), uploadStatus: $('uploadStatus'),
+  downloadShelf: $('downloadShelf'), downloadName: $('downloadName'), downloadStatus: $('downloadStatus'), saveDownloadBtn: $('saveDownloadBtn'), closeDownloadBtn: $('closeDownloadBtn')
 };
 
 const ctx = els.canvas.getContext('2d', { alpha: false, desynchronized: true });
+ctx.imageSmoothingEnabled = true;
+ctx.imageSmoothingQuality = 'high';
 const state = {
   ws: null,
   ready: false,
@@ -20,7 +25,12 @@ const state = {
   lastUrl: '',
   resizingTimer: null,
   pointerDown: null,
-  imageBitmap: null
+  imageBitmap: null,
+  remoteViewport: { width: 320, height: 360 },
+  pendingFileRequest: null,
+  uploadBusy: false,
+  downloads: new Map(),
+  currentDownloadId: null
 };
 
 function viewportSize() {
@@ -82,7 +92,7 @@ function ensureSession() {
 
     ws.onopen = () => {
       const size = viewportSize();
-      ws.send(JSON.stringify({ type: 'init', ...size }));
+      ws.send(JSON.stringify({ type: 'init', ...size, dpr: Math.min(2, Math.max(1, Number(window.devicePixelRatio) || 1)) }));
     };
 
     ws.onmessage = async (event) => {
@@ -144,16 +154,47 @@ function handleServerMessage(message) {
       els.securityDot.classList.add('live');
     }
     setProxy(message.proxy);
+    if (message.viewport?.width && message.viewport?.height) state.remoteViewport = message.viewport;
   } else if (message.type === 'title' && message.title) {
     document.title = `${message.title} — Private Browser`;
   } else if (message.type === 'loading' || message.type === 'identity') {
     showLoading(message.message || 'Loading…');
   } else if (message.type === 'error') {
-    showError(message.message, message.code);
+    const uploadCodes = new Set(['NO_FILE_CHOOSER', 'BAD_UPLOAD', 'BAD_UPLOAD_CHUNK', 'NO_UPLOAD', 'UPLOAD_TOO_LARGE', 'INCOMPLETE_UPLOAD']);
+    if (uploadCodes.has(message.code)) {
+      state.uploadBusy = false;
+      els.chooseFileBtn.disabled = false;
+      els.cancelFileBtn.disabled = false;
+      els.uploadStatus.textContent = message.message || 'The file could not be attached.';
+      show(els.fileDialog, true);
+    } else {
+      showError(message.message, message.code);
+    }
   } else if (message.type === 'expired') {
     state.intentionalClose = true;
     resetSocketState();
     showError(message.message || 'The browser session expired.', 'SESSION_EXPIRED');
+  } else if (message.type === 'fileChooser') {
+    openFileDialog(message);
+  } else if (message.type === 'uploadReady') {
+    els.uploadStatus.textContent = 'Uploading securely to the remote website…';
+  } else if (message.type === 'uploadComplete') {
+    state.uploadBusy = false;
+    show(els.fileDialog, false);
+    resetUploadUi();
+    toast(message.files === 1 ? 'File attached to website.' : `${message.files} files attached to website.`);
+  } else if (message.type === 'uploadCancelled') {
+    state.uploadBusy = false;
+    show(els.fileDialog, false);
+    resetUploadUi();
+  } else if (message.type === 'downloadBegin') {
+    beginDownload(message);
+  } else if (message.type === 'downloadChunk') {
+    appendDownloadChunk(message);
+  } else if (message.type === 'downloadEnd') {
+    finishDownload(message);
+  } else if (message.type === 'downloadError') {
+    failDownload(message);
   }
 }
 
@@ -189,11 +230,13 @@ async function browserAction(action) {
 
 function canvasPoint(event) {
   const rect = els.canvas.getBoundingClientRect();
-  const scaleX = els.canvas.width / rect.width;
-  const scaleY = els.canvas.height / rect.height;
+  const remoteWidth = state.remoteViewport?.width || rect.width;
+  const remoteHeight = state.remoteViewport?.height || rect.height;
+  const scaleX = remoteWidth / rect.width;
+  const scaleY = remoteHeight / rect.height;
   return {
-    x: Math.max(0, Math.min(els.canvas.width, (event.clientX - rect.left) * scaleX)),
-    y: Math.max(0, Math.min(els.canvas.height, (event.clientY - rect.top) * scaleY))
+    x: Math.max(0, Math.min(remoteWidth, (event.clientX - rect.left) * scaleX)),
+    y: Math.max(0, Math.min(remoteHeight, (event.clientY - rect.top) * scaleY))
   };
 }
 
@@ -323,4 +366,195 @@ window.addEventListener('pagehide', () => {
     try { state.ws.send(JSON.stringify({ type: 'end' })); } catch {}
     try { state.ws.close(1000, 'page-hidden'); } catch {}
   }
+});
+
+
+function formatBytes(bytes) {
+  const value = Math.max(0, Number(bytes) || 0);
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(value < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(value / 1024 / 1024).toFixed(value < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}
+
+function resetUploadUi() {
+  state.pendingFileRequest = null;
+  els.localFileInput.value = '';
+  els.uploadProgressBar.style.width = '0%';
+  els.uploadStatus.textContent = '';
+  show(els.uploadProgressWrap, false);
+  els.chooseFileBtn.disabled = false;
+  els.cancelFileBtn.disabled = false;
+}
+
+function openFileDialog(message) {
+  state.pendingFileRequest = message;
+  state.uploadBusy = false;
+  els.fileDialogText.textContent = message.multiple
+    ? 'The remote website is asking you to select one or more files from this device.'
+    : 'The remote website is asking you to select a file from this device.';
+  els.localFileInput.accept = message.accept || '';
+  els.localFileInput.multiple = Boolean(message.multiple);
+  resetUploadUi();
+  state.pendingFileRequest = message;
+  show(els.fileDialog, true);
+}
+
+function blobChunkToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error || new Error('Could not read the selected file.'));
+    reader.onload = () => {
+      const result = String(reader.result || '');
+      resolve(result.slice(result.indexOf(',') + 1));
+    };
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function waitForSocketCapacity() {
+  const started = performance.now();
+  while (state.ws?.readyState === WebSocket.OPEN && state.ws.bufferedAmount > 2_000_000) {
+    if (performance.now() - started > 6000) throw new Error('The upload connection is too slow.');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+async function uploadSelectedFiles(fileList) {
+  if (state.uploadBusy) return;
+  const files = [...fileList];
+  if (!files.length) {
+    send({ type: 'uploadCancel' });
+    show(els.fileDialog, false);
+    resetUploadUi();
+    return;
+  }
+
+  const total = files.reduce((sum, file) => sum + file.size, 0);
+  const maxBytes = 25 * 1024 * 1024;
+  if (total > maxBytes) {
+    els.uploadStatus.textContent = `Selected files are larger than the ${formatBytes(maxBytes)} transfer limit.`;
+    return;
+  }
+
+  state.uploadBusy = true;
+  els.chooseFileBtn.disabled = true;
+  els.cancelFileBtn.disabled = true;
+  show(els.uploadProgressWrap, true);
+  els.uploadStatus.textContent = 'Preparing upload…';
+
+  try {
+    send({
+      type: 'uploadStart',
+      files: files.map((file) => ({ name: file.name, type: file.type || 'application/octet-stream', size: file.size }))
+    });
+
+    const chunkSize = 96 * 1024;
+    let sentBytes = 0;
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index];
+      for (let offset = 0; offset < file.size; offset += chunkSize) {
+        const blob = file.slice(offset, Math.min(file.size, offset + chunkSize));
+        const data = await blobChunkToBase64(blob);
+        await waitForSocketCapacity();
+        if (!send({ type: 'uploadChunk', index, data })) throw new Error('The browser session disconnected during upload.');
+        sentBytes += blob.size;
+        const percent = total ? Math.min(100, Math.round((sentBytes / total) * 100)) : 100;
+        els.uploadProgressBar.style.width = `${percent}%`;
+        els.uploadStatus.textContent = `Uploading ${percent}% • ${formatBytes(sentBytes)} of ${formatBytes(total)}`;
+      }
+    }
+    send({ type: 'uploadEnd' });
+    els.uploadStatus.textContent = 'Attaching file to the website…';
+  } catch (error) {
+    state.uploadBusy = false;
+    els.chooseFileBtn.disabled = false;
+    els.cancelFileBtn.disabled = false;
+    els.uploadStatus.textContent = error.message || 'Upload failed.';
+    send({ type: 'uploadCancel' });
+  }
+}
+
+function decodeBase64Chunk(data) {
+  const binary = atob(data);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function beginDownload(message) {
+  const transfer = { id: message.id, filename: message.filename || 'download', chunks: [], bytes: 0, ready: false };
+  state.downloads.set(message.id, transfer);
+  state.currentDownloadId = message.id;
+  els.downloadName.textContent = transfer.filename;
+  els.downloadStatus.textContent = 'Receiving file from remote website…';
+  els.saveDownloadBtn.disabled = true;
+  show(els.downloadShelf, true);
+}
+
+function appendDownloadChunk(message) {
+  const transfer = state.downloads.get(message.id);
+  if (!transfer || typeof message.data !== 'string') return;
+  try {
+    const chunk = decodeBase64Chunk(message.data);
+    transfer.chunks.push(chunk);
+    transfer.bytes += chunk.byteLength;
+    if (state.currentDownloadId === message.id) els.downloadStatus.textContent = `Receiving… ${formatBytes(transfer.bytes)}`;
+  } catch {
+    failDownload({ id: message.id, message: 'Could not decode the downloaded file.' });
+  }
+}
+
+function finishDownload(message) {
+  const transfer = state.downloads.get(message.id);
+  if (!transfer) return;
+  transfer.ready = true;
+  transfer.filename = message.filename || transfer.filename;
+  transfer.bytes = Number(message.bytes) || transfer.bytes;
+  state.currentDownloadId = message.id;
+  els.downloadName.textContent = transfer.filename;
+  els.downloadStatus.textContent = `Ready to save • ${formatBytes(transfer.bytes)}`;
+  els.saveDownloadBtn.disabled = false;
+  show(els.downloadShelf, true);
+}
+
+function failDownload(message) {
+  if (message.id) state.downloads.delete(message.id);
+  els.downloadName.textContent = 'Download failed';
+  els.downloadStatus.textContent = message.message || 'The file could not be downloaded.';
+  els.saveDownloadBtn.disabled = true;
+  show(els.downloadShelf, true);
+}
+
+els.chooseFileBtn.addEventListener('click', () => {
+  els.localFileInput.value = '';
+  els.localFileInput.click();
+});
+els.cancelFileBtn.addEventListener('click', () => {
+  if (!state.uploadBusy) send({ type: 'uploadCancel' });
+  show(els.fileDialog, false);
+  resetUploadUi();
+});
+els.localFileInput.addEventListener('change', () => uploadSelectedFiles(els.localFileInput.files));
+els.saveDownloadBtn.addEventListener('click', () => {
+  const transfer = state.downloads.get(state.currentDownloadId);
+  if (!transfer?.ready) return;
+  const blob = new Blob(transfer.chunks, { type: 'application/octet-stream' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = transfer.filename;
+  anchor.rel = 'noopener';
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30_000);
+  state.downloads.delete(transfer.id);
+  state.currentDownloadId = null;
+  show(els.downloadShelf, false);
+  toast('Download sent to your device.');
+});
+els.closeDownloadBtn.addEventListener('click', () => {
+  if (state.currentDownloadId) state.downloads.delete(state.currentDownloadId);
+  state.currentDownloadId = null;
+  show(els.downloadShelf, false);
 });
