@@ -1,4 +1,4 @@
-# Private Browser
+# Private Browser`n`n<p align="center">`n  <a href="https://github.com/sponsors/anshdeepofficial"><img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4-EA4AAA?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="Sponsor on GitHub" height="40" /></a>`n  <a href="https://buymeacoffee.com/anshdeepofficial"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" height="40" /></a>`n</p>
 
 A privacy-focused remote browser. The target website runs in a temporary isolated Chromium context on the server and the rendered viewport is streamed to the client over WebSocket. It does not rely on an iframe.
 
@@ -180,10 +180,3 @@ npm test
 ```
 
 GitHub Actions runs the same validation on pushes and pull requests.
-
-## Support Development
-
-This project is free and open source. If you find it useful, you can support continued development through:
-
-- [GitHub Sponsors](https://github.com/sponsors/anshdeepofficial)
-- [Buy Me a Coffee](https://buymeacoffee.com/anshdeepofficial)
